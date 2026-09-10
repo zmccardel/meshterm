@@ -286,6 +286,20 @@ static int pref_verbose;        /* firmware debug + protocol detail     */
  */
 static int pref_passkey;
 
+/*
+ * /whoami asks the radio for everything it shows rather than printing
+ * whatever arrived at connect time. Each reply sets its bit; the request
+ * loop waits until every expected bit is in or the timeout expires.
+ */
+#define FRESH_OWNER 0x01
+#define FRESH_LORA  0x02
+#define FRESH_NET   0x04
+#define FRESH_BT    0x08
+#define FRESH_CONN  0x10
+#define FRESH_WAIT_MS 600
+static unsigned fresh_got, fresh_want;
+static uint32_t pump_nonce;   /* handshake id pump_ms should watch for */
+
 static const char *dev_path = "/dev/cuaU0";
 static speed_t link_baud = B115200;
 static int serial_fd = -1;
@@ -506,6 +520,9 @@ u8_fwd(const char *s, size_t len, size_t start, size_t cols)
 
 static const char *region_str(int r);
 static void cmd_net_quiet(void);
+static int pump(int secs, uint32_t nonce);
+static int pump_ms(int ms);
+static uint32_t pump_nonce;
 static void cmd_chans(void);
 static void handle_channel(const unsigned char *b, size_t n);
 static int chan_lookup(const char *s);
@@ -1144,6 +1161,7 @@ handle_connstatus(const unsigned char *b, size_t n)
    * repeatedly, so anything printed here shows up as spam nobody asked
    * for. /whoami renders the cached values on demand instead.
    */
+  fresh_got |= FRESH_CONN;
   net_ip = ip;
   net_connected = connected;
   net_rssi = rssi;
@@ -1160,10 +1178,7 @@ handle_admin(const unsigned char *b, size_t n)
 {
   const unsigned char *p = b, *end = b + n;
   struct pbfield f, g;
-  char longn[LONGNAME_MAX + 1], shortn[SHORTNAME_MAX + 1];
-  int got_owner = 0;
 
-  longn[0] = shortn[0] = '\0';
   while (pb_next(&p, end, &f) == 1) {
     switch (f.field) {
     case ADM_SESSION_PASSKEY:
@@ -1196,24 +1211,31 @@ handle_admin(const unsigned char *b, size_t n)
     case ADM_GET_OWNER_RESP:
       if (f.wire != 2)
         break;
-      got_owner = 1;
       {
         const unsigned char *q = f.data, *qe = f.data + f.len;
+        struct node *me = node_intern(my_num);
 
-        while (pb_next(&q, qe, &g) == 1) {
+        /*
+         * Fold the reply straight into the node table. /whoami reads from
+         * there, so a name set with /name shows up immediately instead of
+         * waiting for the radio to re-announce itself on the mesh.
+         */
+        while (me != NULL && pb_next(&q, qe, &g) == 1) {
           if (g.wire != 2)
             continue;
           if (g.field == USER_LONG_NAME) {
-            size_t l = g.len < sizeof(longn) - 1 ? g.len : sizeof(longn) - 1;
-            memcpy(longn, g.data, l);
-            longn[l] = '\0';
+            size_t l = g.len < sizeof(me->longname) - 1 ?
+                g.len : sizeof(me->longname) - 1;
+            memcpy(me->longname, g.data, l);
+            me->longname[l] = '\0';
           } else if (g.field == USER_SHORT_NAME) {
-            size_t l = g.len < sizeof(shortn) - 1 ?
-                g.len : sizeof(shortn) - 1;
-            memcpy(shortn, g.data, l);
-            shortn[l] = '\0';
+            size_t l = g.len < sizeof(me->shortname) - 1 ?
+                g.len : sizeof(me->shortname) - 1;
+            memcpy(me->shortname, g.data, l);
+            me->shortname[l] = '\0';
           }
         }
+        fresh_got |= FRESH_OWNER;
       }
       break;
     default:
@@ -1221,11 +1243,6 @@ handle_admin(const unsigned char *b, size_t n)
         sysmsg("AdminMessage field %u (%zu bytes)", f.field, f.len);
       break;
     }
-  }
-  if (got_owner) {
-    hdrmsg("owner");
-    sysmsg("long   %s", longn[0] ? longn : "(unset)");
-    sysmsg("short  %s", shortn[0] ? shortn : "(unset)");
   }
 }
 
@@ -1476,6 +1493,7 @@ handle_config(const unsigned char *b, size_t n)
       const unsigned char *q = f.data, *qe = f.data + f.len;
 
       net_seen = 1;
+      fresh_got |= FRESH_NET;
       net_wifi_on = 0;
       net_ssid[0] = '\0';
       while (pb_next(&q, qe, &g) == 1) {
@@ -1494,6 +1512,7 @@ handle_config(const unsigned char *b, size_t n)
       const unsigned char *q = f.data, *qe = f.data + f.len;
 
       bt_seen = 1;
+      fresh_got |= FRESH_BT;
       bt_on = 0;
       while (pb_next(&q, qe, &g) == 1)
         if (g.field == BT_ENABLED && g.wire == 0)
@@ -1503,6 +1522,7 @@ handle_config(const unsigned char *b, size_t n)
     if (f.field != CFG_FIELD(CFGTYPE_LORA) || f.wire != 2)
       continue;
     lora_seen = 1;
+    fresh_got |= FRESH_LORA;
     if (f.len <= sizeof(lora_raw)) {
       memcpy(lora_raw, f.data, f.len);
       lora_rawlen = f.len;
@@ -1886,7 +1906,7 @@ cmd_help(void)
   sysmsg("%-17s %s", "/chan share [ch]", "print a URL others can join with");
   sysmsg("%-17s %s", "/chan join <url>", "join a channel from a shared URL");
   sysmsg("%-17s %s", "/mute [node]", "hide a node; /mute clear [node] to undo");
-  sysmsg("%-17s %s", "/whoami", "show this node and its firmware");
+  sysmsg("%-17s %s", "/whoami", "read this node's settings from the radio");
   sysmsg("%-17s %s", "/set [key val]",
       "local prefs: time|names|hex|color|verbose|passkey");
   hdrmsg("%-17s %s", "radio config", "writes to the node");
@@ -2128,15 +2148,62 @@ cmd_save(void)
 }
 
 static void
-cmd_owner_get(void)
+send_get_owner(void)
 {
   unsigned char pb[8];
   size_t n = 0;
 
   n += pb_tag(pb + n, ADM_GET_OWNER_REQ, 0);
   pb[n++] = 1;
-  if (send_admin(pb, n) == 0)
-    sysmsg("requested owner...");
+  send_admin(pb, n);
+}
+
+static void
+send_get_config(int cfgtype)
+{
+  unsigned char pb[8];
+  size_t n = 0;
+
+  n += pb_tag(pb + n, ADM_GET_CONFIG_REQ, 0);
+  n += pb_varint(pb + n, (uint64_t)cfgtype);
+  send_admin(pb, n);
+}
+
+/*
+ * Ask for everything /whoami displays and wait briefly for the replies.
+ * Skipped while a config edit is in flight, since those replies belong to
+ * the edit rather than to us.
+ */
+static void
+refresh_status(void)
+{
+  int waited;
+
+  if (pend_type >= 0 || my_num == 0)
+    return;
+  fresh_got = 0;
+  fresh_want = FRESH_OWNER | FRESH_LORA | FRESH_NET | FRESH_BT;
+  if (has_wifi)
+    fresh_want |= FRESH_CONN;
+
+  send_get_owner();
+  send_get_config(CFGTYPE_LORA);
+  send_get_config(CFGTYPE_NETWORK);
+  send_get_config(CFGTYPE_BLUETOOTH);
+  if (has_wifi)
+    cmd_net_quiet();
+
+  /*
+   * Wait only briefly. Not every firmware answers every admin request --
+   * anything unanswered would otherwise stall the command for the whole
+   * timeout, which is worse than showing a cached value.
+   */
+  for (waited = 0; waited < FRESH_WAIT_MS && !quitflag &&
+      (fresh_got & fresh_want) != fresh_want; waited += 100) {
+    if (pump_ms(100) < 0)
+      break;
+  }
+  fresh_want = 0;
 }
 
 /*
@@ -2190,11 +2257,23 @@ cmd_owner_set(char *args)
   n += u;
 
   if (send_admin(pb, n) == 0) {
+    struct node *me = node_intern(my_num);
+
     sysmsg("set owner: long=\"%s\"%s%s%s", longn,
         shortn ? " short=\"" : "", shortn ? shortn : "",
         shortn ? "\"" : "");
-    /* Read back rather than assume it took. */
-    cmd_owner_get();
+    /*
+     * Record what we sent. Not every firmware answers get_owner_request,
+     * so waiting for a read-back before believing our own write leaves
+     * /whoami showing the old name indefinitely. The request still goes
+     * out and will correct us if the radio disagrees.
+     */
+    if (me != NULL) {
+      snprintf(me->longname, sizeof(me->longname), "%s", longn);
+      if (shortn != NULL)
+        snprintf(me->shortname, sizeof(me->shortname), "%s", shortn);
+    }
+    send_get_owner();
   }
 }
 
@@ -2662,12 +2741,10 @@ do_command(char *line)
       strcasecmp(cmd, "/channels") == 0) {
     cmd_chans();
   } else if (strcasecmp(cmd, "/whoami") == 0) {
+    refresh_status();
     {
       const struct node *me = node_find(my_num);
 
-      /* Ask before printing; the reply lands in time for the next call. */
-      if (has_wifi)
-        cmd_net_quiet();
       hdrmsg("this node");
       sysmsg("id        !%08x", my_num);
       sysmsg("long      %s",
@@ -2700,20 +2777,21 @@ do_command(char *line)
         sysmsg("bluetooth %s", bt_on ? "on" : "off");
     }
     if (has_wifi) {
-      if (!net_seen)
+      if (!net_seen) {
         sysmsg("wifi      unknown");
-      else if (!net_wifi_on)
+      } else if (!net_wifi_on) {
         sysmsg("wifi      off");
-      else if (net_ip != 0)
+      } else if (net_ip != 0) {
         sysmsg("wifi      on  \"%s\"  %u.%u.%u.%u:%d%s", net_ssid,
             net_ip & 0xff, (net_ip >> 8) & 0xff, (net_ip >> 16) & 0xff,
             (net_ip >> 24) & 0xff, TCP_PORT,
             net_connected ? "" : "  (not associated)");
-      if (net_ip != 0 && net_rssi != 0)
-        sysmsg("signal    %d dBm", net_rssi);
-      else
-        sysmsg("wifi      on  \"%s\"  (waiting for address -- run /whoami again)",
+        if (net_rssi != 0)
+          sysmsg("signal    %d dBm", net_rssi);
+      } else {
+        sysmsg("wifi      on  \"%s\"  (no address -- not associated?)",
             net_ssid[0] ? net_ssid : "?");
+      }
     }
   } else if (strcasecmp(cmd, "/name") == 0) {
     cmd_owner_set(args);
@@ -2847,6 +2925,13 @@ key(unsigned char c)
     return 0;
   }
   if (esc == 2) {
+    /*
+     * Consume CSI parameter and intermediate bytes so a modified arrow
+     * such as ESC [ 1 ; 5 A is recognised rather than having its digits
+     * fall through and land in the input line as literal text.
+     */
+    if ((c >= '0' && c <= '9') || c == ';' || c == '?')
+      return 0;
     esc = 0;
     if (c == 'A')                       /* up */
       hist_up();
@@ -2900,6 +2985,7 @@ key(unsigned char c)
   case 0x15:    /* ctrl-U */
     ilen = icur = 0;
     ibuf[0] = '\0';
+    hist_pos = -1;
     break;
   case 0x17:    /* ctrl-W */
     while (icur > 0 && isspace((unsigned char)ibuf[icur - 1])) {
@@ -3064,6 +3150,57 @@ open_port(const char *dev)
 
 /* Drain the port for up to `secs`, decoding frames. Returns 1 if the
  * nonce came back as config_complete_id. */
+/*
+ * Read and decode for roughly ms milliseconds. Returns 1 if the handshake
+ * nonce came back, 2 if everything refresh_status is waiting on arrived,
+ * 0 on timeout, -1 on a link error.
+ */
+static int
+pump_ms(int ms)
+{
+  unsigned char buf[512];
+  struct timeval tv;
+  fd_set rfds;
+  ssize_t n;
+  size_t i;
+  int left = ms;
+
+  while (left > 0 && !quitflag) {
+    int slice = left < 100 ? left : 100;
+
+    FD_ZERO(&rfds);
+    FD_SET(serial_fd, &rfds);
+    tv.tv_sec = 0;
+    tv.tv_usec = slice * 1000;
+    if (select(serial_fd + 1, &rfds, NULL, NULL, &tv) < 0) {
+      if (errno == EINTR)
+        continue;
+      return -1;
+    }
+    left -= slice;
+    if (!FD_ISSET(serial_fd, &rfds))
+      continue;
+    n = read(serial_fd, buf, sizeof(buf));
+    if (n < 0) {
+      if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)
+        continue;
+      return -1;
+    }
+    if (n == 0 && is_tcp)
+      return -1;
+    for (i = 0; i < (size_t)n; i++) {
+      if (!feed(buf[i]))
+        continue;
+      dbg_flush();
+      if (handle_fromradio(rxframe, rxlen) == pump_nonce && pump_nonce != 0)
+        return 1;
+      if (fresh_want != 0 && (fresh_got & fresh_want) == fresh_want)
+        return 2;
+    }
+  }
+  return 0;
+}
+
 static int
 pump(int secs, uint32_t nonce)
 {
@@ -3088,8 +3225,10 @@ pump(int secs, uint32_t nonce)
       if (!feed(buf[i]))
         continue;
       dbg_flush();
-      if (handle_fromradio(rxframe, rxlen) == nonce)
+      if (handle_fromradio(rxframe, rxlen) == nonce && nonce != 0)
         return 1;
+      if (fresh_want != 0 && (fresh_got & fresh_want) == fresh_want)
+        return 2;
     }
   }
   return 0;
@@ -3254,7 +3393,6 @@ main(int argc, char **argv)
 
   if (link_up() < 0)
     return 1;
-  sysmsg("connected as %s", my_num ? node_str(my_num) : "unknown");
   if (interactive)
     sysmsg("/help for commands");
 
