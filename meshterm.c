@@ -117,10 +117,18 @@
  * oneof field number is always the ConfigType plus one, which is how we
  * find the sub-message inside a get_config_response.
  */
+#define CFGTYPE_DEVICE   0
 #define CFGTYPE_NETWORK  3
 #define CFGTYPE_LORA     5
 #define CFGTYPE_BLUETOOTH 6
 #define CFG_FIELD(t)     ((t) + 1)
+
+/*
+ * DeviceConfig. Note field 9 next door is is_managed, which locks the node
+ * against further admin changes -- the read-modify-write below preserves
+ * every field it is not explicitly replacing, so it is never touched.
+ */
+#define DEV_LED_OFF      12
 
 /* LoRaConfig */
 #define LORA_REGION      7
@@ -207,6 +215,7 @@ static size_t lora_rawlen;
 
 /* Config.network / Config.bluetooth, as reported in the config dump. */
 static int net_seen, net_wifi_on, bt_seen, bt_on;
+static int dev_seen, dev_led_off;
 static char net_ssid[40];
 
 /* Filled in by /net (DeviceConnectionStatus); 0 when we have not asked. */
@@ -296,6 +305,7 @@ static int pref_passkey;
 #define FRESH_NET   0x04
 #define FRESH_BT    0x08
 #define FRESH_CONN  0x10
+#define FRESH_DEV   0x20
 #define FRESH_WAIT_MS 600
 static unsigned fresh_got, fresh_want;
 static uint32_t pump_nonce;   /* handshake id pump_ms should watch for */
@@ -1489,6 +1499,17 @@ handle_config(const unsigned char *b, size_t n)
   struct pbfield f, g;
 
   while (pb_next(&p, end, &f) == 1) {
+    if (f.field == CFG_FIELD(CFGTYPE_DEVICE) && f.wire == 2) {
+      const unsigned char *q = f.data, *qe = f.data + f.len;
+
+      dev_seen = 1;
+      fresh_got |= FRESH_DEV;
+      dev_led_off = 0;
+      while (pb_next(&q, qe, &g) == 1)
+        if (g.field == DEV_LED_OFF && g.wire == 0)
+          dev_led_off = g.varint != 0;
+      continue;
+    }
     if (f.field == CFG_FIELD(CFGTYPE_NETWORK) && f.wire == 2) {
       const unsigned char *q = f.data, *qe = f.data + f.len;
 
@@ -1914,6 +1935,7 @@ cmd_help(void)
   sysmsg("%-17s %s", "/region [name]", "set LoRa region (bare /region lists them)");
   sysmsg("%-17s %s", "/wifi <ssid> [pw]", "join a network; /wifi off to disable");
   sysmsg("%-17s %s", "/bt on|off", "enable or disable bluetooth");
+  sysmsg("%-17s %s", "/led on|off", "the onboard heartbeat LED");
   sysmsg("%-17s %s", "/reboot [secs]", "reboot the node (default 5s)");
   sysmsg("%-17s %s", "/save", "write settings to ~/.meshtermrc");
   sysmsg("%-17s %s", "/quit", "disconnect and exit");
@@ -2182,11 +2204,12 @@ refresh_status(void)
   if (pend_type >= 0 || my_num == 0)
     return;
   fresh_got = 0;
-  fresh_want = FRESH_OWNER | FRESH_LORA | FRESH_NET | FRESH_BT;
+  fresh_want = FRESH_OWNER | FRESH_LORA | FRESH_NET | FRESH_BT | FRESH_DEV;
   if (has_wifi)
     fresh_want |= FRESH_CONN;
 
   send_get_owner();
+  send_get_config(CFGTYPE_DEVICE);
   send_get_config(CFGTYPE_LORA);
   send_get_config(CFGTYPE_NETWORK);
   send_get_config(CFGTYPE_BLUETOOTH);
@@ -2667,6 +2690,32 @@ cmd_bt(char *args)
 }
 
 static void
+cmd_led(char *args)
+{
+  int on;
+
+  if (args == NULL || *args == '\0') {
+    errmsg("usage: /led on|off");
+    return;
+  }
+  if (strcasecmp(args, "on") == 0)
+    on = 1;
+  else if (strcasecmp(args, "off") == 0)
+    on = 0;
+  else {
+    errmsg("usage: /led on|off");
+    return;
+  }
+  pend_clear();
+  /* The stored field is inverted: led_heartbeat_disabled. */
+  if (pend_set_varint(DEV_LED_OFF, on ? 0 : 1) < 0) {
+    errmsg("internal: edit buffer full");
+    return;
+  }
+  pend_begin(CFGTYPE_DEVICE, on ? "led -> on" : "led -> off");
+}
+
+static void
 cmd_net_quiet(void)
 {
   unsigned char pb[8];
@@ -2762,6 +2811,8 @@ do_command(char *line)
     sysmsg("preset    %s%s", preset_str(),
         (lora_seen && lora_use_preset && lora_preset >= NPRESETS) ?
         "  (newer than this build knows)" : "");
+    if (dev_seen)
+      sysmsg("led       %s", dev_led_off ? "off" : "on");
     if (has_bt) {
       /*
        * Config.bluetooth.enabled is the stored setting, not the live
@@ -2799,6 +2850,8 @@ do_command(char *line)
     cmd_region(args);
   } else if (strcasecmp(cmd, "/wifi") == 0) {
     cmd_wifi(args);
+  } else if (strcasecmp(cmd, "/led") == 0) {
+    cmd_led(args);
   } else if (strcasecmp(cmd, "/bt") == 0) {
     cmd_bt(args);
   } else if (strcasecmp(cmd, "/reboot") == 0) {
