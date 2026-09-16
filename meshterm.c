@@ -11,7 +11,7 @@
  * is an unofficial third-party client and is not affiliated with, endorsed
  * by, or supported by that project.
  *
- * Copyright (C) 2026 Zach McCardel
+ * Copyright (C) 2026 Zach McCardel 
  *
  * Permission to use, copy, modify, and/or distribute this software for any
  * purpose with or without fee is hereby granted.
@@ -223,11 +223,6 @@ static uint32_t net_ip;
 static int net_connected, net_rssi;
 
 /*
- * FromRadio.metadata (DeviceMetadata). firmware_version is a string, so it
- * is the one field that tells us which protobuf generation we are actually
- * talking to rather than the one we were compiled against.
- */
-/*
  * Some firmware requires a session passkey on admin writes. Local admin
  * over the attached interface has historically been exempt, so we send
  * without one and cache whatever the radio hands back, echoing it on
@@ -237,6 +232,11 @@ static int net_connected, net_rssi;
 static unsigned char session_key[8];
 static size_t session_key_len;
 
+/*
+ * FromRadio.metadata (DeviceMetadata). firmware_version is a string, so it
+ * is the one field that tells us which protobuf generation we are actually
+ * talking to rather than the one we were compiled against.
+ */
 static char fw_version[40];
 static int hw_model = -1;
 static int has_wifi, has_bt, has_eth;
@@ -308,7 +308,6 @@ static int pref_passkey;
 #define FRESH_DEV   0x20
 #define FRESH_WAIT_MS 600
 static unsigned fresh_got, fresh_want;
-static uint32_t pump_nonce;   /* handshake id pump_ms should watch for */
 
 static const char *dev_path = "/dev/cuaU0";
 static speed_t link_baud = B115200;
@@ -475,8 +474,6 @@ pb_varint(unsigned char *out, uint64_t v)
 /* output + input line                                                    */
 /* ====================================================================== */
 
-
-
 /*
  * Cursor motion has to count characters, not bytes, or an arrow key lands
  * inside a multi-byte sequence and the next keystroke corrupts it. These
@@ -532,7 +529,6 @@ static const char *region_str(int r);
 static void cmd_net_quiet(void);
 static int pump(int secs, uint32_t nonce);
 static int pump_ms(int ms);
-static uint32_t pump_nonce;
 static void cmd_chans(void);
 static void handle_channel(const unsigned char *b, size_t n);
 static int chan_lookup(const char *s);
@@ -2091,7 +2087,7 @@ cmd_set(char *args)
   key = strtok(args, " \t");
   val = strtok(NULL, " \t");
   if (key == NULL || val == NULL) {
-    errmsg("usage: /set <time|names|hex|color|verbose> <on|off>");
+    errmsg("usage: /set <time|names|hex|color|verbose|passkey> <on|off>");
     return;
   }
   if (setpref(key, val) < 0)
@@ -3075,11 +3071,6 @@ key(unsigned char c)
 /* main                                                                   */
 /* ====================================================================== */
 
-/*
- * TCP 4403 carries byte-for-byte the same StreamAPI framing as the serial
- * port, so everything above the transport is unchanged. A receive timeout
- * stands in for the tty's VTIME so reads return instead of blocking.
- */
 static const struct {
   const char *name;
   speed_t code;
@@ -3111,6 +3102,11 @@ set_baud(const char *arg)
   return -1;
 }
 
+/*
+ * TCP 4403 carries byte-for-byte the same StreamAPI framing as the serial
+ * port, so everything above the transport is unchanged. A receive timeout
+ * stands in for the tty's VTIME so reads return instead of blocking.
+ */
 static int
 open_tcp(const char *spec)
 {
@@ -3201,12 +3197,10 @@ open_port(const char *dev)
   return fd;
 }
 
-/* Drain the port for up to `secs`, decoding frames. Returns 1 if the
- * nonce came back as config_complete_id. */
 /*
- * Read and decode for roughly ms milliseconds. Returns 1 if the handshake
- * nonce came back, 2 if everything refresh_status is waiting on arrived,
- * 0 on timeout, -1 on a link error.
+ * Read and decode for roughly ms milliseconds. Returns 1 once everything
+ * refresh_status is waiting on has arrived, 0 on timeout, -1 on a link
+ * error. The handshake uses pump() instead, which counts in seconds.
  */
 static int
 pump_ms(int ms)
@@ -3245,10 +3239,9 @@ pump_ms(int ms)
       if (!feed(buf[i]))
         continue;
       dbg_flush();
-      if (handle_fromradio(rxframe, rxlen) == pump_nonce && pump_nonce != 0)
-        return 1;
+      (void)handle_fromradio(rxframe, rxlen);
       if (fresh_want != 0 && (fresh_got & fresh_want) == fresh_want)
-        return 2;
+        return 1;
     }
   }
   return 0;
@@ -3309,19 +3302,26 @@ link_up(void)
   if ((serial_fd = open_port(dev_path)) < 0)
     return -1;
 
-  if ((wake = malloc(WAKE_BYTES)) == NULL) {
-    perror("malloc");
-    close(serial_fd);
-    serial_fd = -1;
-    return -1;
-  }
-  memset(wake, START2, WAKE_BYTES);
-  if (write(serial_fd, wake, WAKE_BYTES) != (ssize_t)WAKE_BYTES)
-    perror("write (wake)");
-  free(wake);
-  if (!is_tcp)
+  /*
+   * The START2 run wakes a sleeping ESP32 and flushes a frame parser left
+   * part-way through by a previous session. Neither applies to a socket
+   * that was just opened, so skip it there rather than pushing half a
+   * kilobyte of filler at the firmware's TCP server.
+   */
+  if (!is_tcp) {
+    if ((wake = malloc(WAKE_BYTES)) == NULL) {
+      perror("malloc");
+      close(serial_fd);
+      serial_fd = -1;
+      return -1;
+    }
+    memset(wake, START2, WAKE_BYTES);
+    if (write(serial_fd, wake, WAKE_BYTES) != (ssize_t)WAKE_BYTES)
+      perror("write (wake)");
+    free(wake);
     tcdrain(serial_fd);
-  usleep(100000);
+    usleep(100000);
+  }
 
   nonce = (uint32_t)rand() | 1u;
   sysmsg("connecting to %s", dev_path);
@@ -3340,8 +3340,6 @@ link_up(void)
     return -1;
   }
   sysmsg("connected as %s", my_num ? node_str(my_num) : "unknown");
-  if (has_wifi)
-    cmd_net_quiet();
   return 0;
 }
 
@@ -3350,10 +3348,35 @@ link_up(void)
  * gave up. A node that has just been told to reboot takes a few seconds to
  * come back, and a TCP node considerably longer.
  */
+static time_t link_last_up;
+
+static void
+link_mark_up(void)
+{
+  link_last_up = time(NULL);
+}
+
 static int
 link_retry(void)
 {
+  static int rapid;
   int delay = 2;
+
+  /*
+   * A link that drops within seconds of coming up is not a flaky network;
+   * something is actively closing it. Say so instead of scrolling the same
+   * three lines until the user gives up.
+   */
+  if (link_last_up != 0 && time(NULL) - link_last_up < 10) {
+    if (++rapid == 3) {
+      errmsg("the link keeps dropping seconds after connecting");
+      sysmsg("something is closing it -- another client already attached,");
+      sysmsg("or the node rebooting. Run with -v to see what it reports,");
+      sysmsg("and try serial to confirm the node itself is healthy.");
+    }
+  } else {
+    rapid = 0;
+  }
 
   if (serial_fd >= 0) {
     close(serial_fd);
@@ -3367,8 +3390,10 @@ link_retry(void)
       sleep(1);
     if (quitflag)
       break;
-    if (link_up() == 0)
+    if (link_up() == 0) {
+      link_mark_up();
       return 0;
+    }
     if ((delay *= 2) > 30)
       delay = 30;
   }
@@ -3446,6 +3471,7 @@ main(int argc, char **argv)
 
   if (link_up() < 0)
     return 1;
+  link_mark_up();
   if (interactive)
     sysmsg("/help for commands");
 
